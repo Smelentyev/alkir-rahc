@@ -17,6 +17,8 @@ import java.time.Instant;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -61,6 +63,7 @@ public class RacServicePool {
         var pooled = pool.compute(key, (k, existing) -> {
             if (existing != null && !existing.isExpired(now, ttlSeconds)) {
                 existing.updateLastAccess(now);
+                existing.acquire();
                 LOGGER.debug("Reusing pooled RacService for key: {}", k);
                 return existing;
             }
@@ -68,16 +71,18 @@ public class RacServicePool {
             // Закрываем старое соединение если есть
             if (existing != null) {
                 LOGGER.debug("Closing expired RacService for key: {}", k);
-                existing.closeQuietly();
+                existing.requestClose();
             }
 
             LOGGER.debug("Creating new RacService for key: {}", k);
             var configurationProperties = connection.toConfigurationProperties();
             var racService = racServiceObjectProvider.getObject(configurationProperties, factory);
-            return new PooledRacService(racService, now);
+            var created = new PooledRacService(racService, now);
+            created.acquire();
+            return created;
         });
 
-        return new PooledRacServiceWrapper(pooled.getRacService());
+        return new PooledRacServiceWrapper(pooled);
     }
 
     /**
@@ -88,7 +93,7 @@ public class RacServicePool {
         var removed = pool.remove(key);
         if (removed != null) {
             LOGGER.debug("Invalidating RacService for key: {}", key);
-            removed.closeQuietly();
+            removed.requestClose();
         }
     }
 
@@ -107,7 +112,7 @@ public class RacServicePool {
             var entry = iterator.next();
             if (entry.getValue().isExpired(now, ttlSeconds)) {
                 LOGGER.debug("Removing expired RacService for key: {}", entry.getKey());
-                entry.getValue().closeQuietly();
+                entry.getValue().requestClose();
                 iterator.remove();
                 expiredCount++;
             }
@@ -141,7 +146,7 @@ public class RacServicePool {
         var removed = pool.remove(oldest.getKey());
         if (removed != null) {
             LOGGER.debug("Evicting oldest RacService for key: {}", oldest.getKey());
-            removed.closeQuietly();
+            removed.requestClose();
             return true;
         }
 
@@ -175,6 +180,9 @@ public class RacServicePool {
     private static class PooledRacService {
         private final RacService racService;
         private volatile Instant lastAccess;
+        private final AtomicInteger activeUsages = new AtomicInteger(0);
+        private final AtomicBoolean closeRequested = new AtomicBoolean(false);
+        private final AtomicBoolean closed = new AtomicBoolean(false);
 
         PooledRacService(RacService racService, Instant createdAt) {
             this.racService = racService;
@@ -193,11 +201,39 @@ public class RacServicePool {
             this.lastAccess = time;
         }
 
+        void acquire() {
+            activeUsages.incrementAndGet();
+        }
+
+        void release() {
+            var usages = activeUsages.decrementAndGet();
+            if (usages < 0) {
+                activeUsages.incrementAndGet();
+                LOGGER.warn("Detected extra release() call for pooled RacService");
+                return;
+            }
+
+            if (usages == 0 && closeRequested.get()) {
+                closeQuietly();
+            }
+        }
+
         boolean isExpired(Instant now, long ttlSeconds) {
             return lastAccess.plusSeconds(ttlSeconds).isBefore(now);
         }
 
+        void requestClose() {
+            closeRequested.set(true);
+            if (activeUsages.get() == 0) {
+                closeQuietly();
+            }
+        }
+
         void closeQuietly() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+
             try {
                 racService.close();
             } catch (Exception e) {
@@ -216,16 +252,21 @@ public class RacServicePool {
     // Долгосрочно лучше выделить интерфейс для RacService или использовать proxy.
     private static final class PooledRacServiceWrapper extends RacService {
 
+        private final PooledRacService pooled;
         private final RacService delegate;
+        private final AtomicBoolean released = new AtomicBoolean(false);
 
-        PooledRacServiceWrapper(RacService delegate) {
+        PooledRacServiceWrapper(PooledRacService pooled) {
             super(null, null);
-            this.delegate = delegate;
+            this.pooled = pooled;
+            this.delegate = pooled.getRacService();
         }
 
         @Override
         public void close() {
-            // Не закрываем - соединение остаётся в пуле
+            if (released.compareAndSet(false, true)) {
+                pooled.release();
+            }
         }
 
         @Override
