@@ -8,6 +8,7 @@ import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Unmatched;
@@ -22,6 +23,7 @@ import java.util.regex.Pattern;
 
 @SpringBootApplication
 @ConfigurationPropertiesScan
+@EnableScheduling
 @RequiredArgsConstructor
 @Command(
     name = "rahc",
