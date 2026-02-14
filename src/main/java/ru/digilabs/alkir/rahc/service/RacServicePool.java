@@ -56,33 +56,46 @@ public class RacServicePool {
      */
     public RacService getRacService(ConnectionDTO connection) {
         var key = buildKey(connection);
-        var now = Instant.now();
+        var configurationProperties = connection.toConfigurationProperties();
 
-        evictIfPoolIsFullForNewKey(key);
+        while (true) {
+            var now = Instant.now();
+            var existing = pool.get(key);
 
-        var pooled = pool.compute(key, (k, existing) -> {
             if (existing != null && !existing.isExpired(now, ttlSeconds)) {
                 existing.updateLastAccess(now);
                 existing.acquire();
-                LOGGER.debug("Reusing pooled RacService for key: {}", k);
-                return existing;
+                LOGGER.debug("Reusing pooled RacService for key: {}", key);
+                return new PooledRacServiceWrapper(existing);
             }
 
-            // Закрываем старое соединение если есть
-            if (existing != null) {
-                LOGGER.debug("Closing expired RacService for key: {}", k);
-                existing.requestClose();
+            if (existing == null) {
+                evictIfPoolIsFullForNewKey(key);
             }
 
-            LOGGER.debug("Creating new RacService for key: {}", k);
-            var configurationProperties = connection.toConfigurationProperties();
+            LOGGER.debug("Creating new RacService for key: {}", key);
             var racService = racServiceObjectProvider.getObject(configurationProperties, factory);
             var created = new PooledRacService(racService, now);
             created.acquire();
-            return created;
-        });
 
-        return new PooledRacServiceWrapper(pooled);
+            if (existing == null) {
+                var winner = pool.putIfAbsent(key, created);
+                if (winner == null) {
+                    return new PooledRacServiceWrapper(created);
+                }
+
+                created.requestClose();
+                continue;
+            }
+
+            if (pool.replace(key, existing, created)) {
+                LOGGER.debug("Closing expired RacService for key: {}", key);
+                existing.requestClose();
+                return new PooledRacServiceWrapper(created);
+            }
+
+            created.requestClose();
+        }
     }
 
     /**
