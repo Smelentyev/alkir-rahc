@@ -76,11 +76,11 @@ public class RacServicePool {
             LOGGER.debug("Creating new RacService for key: {}", key);
             var racService = racServiceObjectProvider.getObject(configurationProperties, factory);
             var created = new PooledRacService(racService, now);
-            created.acquire();
 
             if (existing == null) {
                 var winner = pool.putIfAbsent(key, created);
                 if (winner == null) {
+                    created.acquire();
                     return new PooledRacServiceWrapper(created);
                 }
 
@@ -91,6 +91,7 @@ public class RacServicePool {
             if (pool.replace(key, existing, created)) {
                 LOGGER.debug("Closing expired RacService for key: {}", key);
                 existing.requestClose();
+                created.acquire();
                 return new PooledRacServiceWrapper(created);
             }
 
@@ -125,8 +126,8 @@ public class RacServicePool {
             var entry = iterator.next();
             if (entry.getValue().isExpired(now, ttlSeconds)) {
                 LOGGER.debug("Removing expired RacService for key: {}", entry.getKey());
-                entry.getValue().requestClose();
                 iterator.remove();
+                entry.getValue().requestClose();
                 expiredCount++;
             }
         }
@@ -149,17 +150,20 @@ public class RacServicePool {
 
     private boolean evictOldest() {
         var oldest = pool.entrySet().stream()
-            .min((e1, e2) -> e1.getValue().getLastAccess().compareTo(e2.getValue().getLastAccess()))
+            .min(java.util.Comparator
+                .<Map.Entry<String, PooledRacService>>comparingInt(e -> e.getValue().isIdle() ? 0 : 1)
+                .thenComparing(e -> e.getValue().getLastAccess()))
             .orElse(null);
 
         if (oldest == null) {
             return false;
         }
 
-        var removed = pool.remove(oldest.getKey());
-        if (removed != null) {
+        var key = oldest.getKey();
+        var target = oldest.getValue();
+        if (pool.remove(key, target)) {
             LOGGER.debug("Evicting oldest RacService for key: {}", oldest.getKey());
-            removed.requestClose();
+            target.requestClose();
             return true;
         }
 
@@ -216,6 +220,10 @@ public class RacServicePool {
 
         void acquire() {
             activeUsages.incrementAndGet();
+        }
+
+        boolean isIdle() {
+            return activeUsages.get() == 0;
         }
 
         void release() {
