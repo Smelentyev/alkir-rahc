@@ -97,9 +97,6 @@ dependencies {
 
 	implementation("org.awaitility", "awaitility", "4.3.0")
 
-	implementation("org.springframework.boot:spring-boot-starter-cache")
-	implementation("com.github.ben-manes.caffeine:caffeine")
-
 	testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
 

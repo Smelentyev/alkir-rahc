@@ -10,8 +10,13 @@ import org.springframework.stereotype.Service;
 import ru.digilabs.alkir.rahc.configuration.RasConfigurationProperties;
 import ru.digilabs.alkir.rahc.dto.ConnectionDTO;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.util.HexFormat;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -51,6 +56,8 @@ public class RacServicePool {
         var key = buildKey(connection);
         var now = Instant.now();
 
+        evictIfPoolIsFullForNewKey(key);
+
         var pooled = pool.compute(key, (k, existing) -> {
             if (existing != null && !existing.isExpired(now, ttlSeconds)) {
                 existing.updateLastAccess(now);
@@ -62,11 +69,6 @@ public class RacServicePool {
             if (existing != null) {
                 LOGGER.debug("Closing expired RacService for key: {}", k);
                 existing.closeQuietly();
-            }
-
-            // Проверяем размер пула
-            if (pool.size() >= maxPoolSize) {
-                evictOldest();
             }
 
             LOGGER.debug("Creating new RacService for key: {}", k);
@@ -92,6 +94,8 @@ public class RacServicePool {
 
     /**
      * Периодическая очистка устаревших соединений.
+     * Используется best-effort подход: из-за weakly consistent итератора ConcurrentHashMap
+     * соединение может пережить один цикл очистки при конкурентном обновлении/добавлении.
      */
     @Scheduled(fixedDelayString = "${rac.pool.cleanup-interval-ms:60000}")
     public void cleanupExpired() {
@@ -117,22 +121,48 @@ public class RacServicePool {
     /**
      * Вытесняет самое старое соединение из пула.
      */
-    private void evictOldest() {
+    private void evictIfPoolIsFullForNewKey(String key) {
+        while (pool.size() >= maxPoolSize && !pool.containsKey(key)) {
+            if (!evictOldest()) {
+                return;
+            }
+        }
+    }
+
+    private boolean evictOldest() {
         var oldest = pool.entrySet().stream()
             .min((e1, e2) -> e1.getValue().getLastAccess().compareTo(e2.getValue().getLastAccess()))
             .orElse(null);
 
-        if (oldest != null) {
-            LOGGER.debug("Evicting oldest RacService for key: {}", oldest.getKey());
-            pool.remove(oldest.getKey());
-            oldest.getValue().closeQuietly();
+        if (oldest == null) {
+            return false;
         }
+
+        var removed = pool.remove(oldest.getKey());
+        if (removed != null) {
+            LOGGER.debug("Evicting oldest RacService for key: {}", oldest.getKey());
+            removed.closeQuietly();
+            return true;
+        }
+
+        return false;
     }
 
     private String buildKey(ConnectionDTO connection) {
         var props = connection.toConfigurationProperties();
+        var hashedPassword = sha256Hex(props.getClusterAdminPassword());
         return props.getAddress() + ":" + props.getPort() + ":" +
-            props.getClusterAdminUsername() + ":" + props.getClusterAdminPassword();
+            props.getClusterAdminUsername() + ":" + hashedPassword;
+    }
+
+    private String sha256Hex(String value) {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            var safeValue = Objects.requireNonNullElse(value, "");
+            return HexFormat.of().formatHex(digest.digest(safeValue.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 algorithm is not available", e);
+        }
     }
 
     public int getPoolSize() {
@@ -144,7 +174,7 @@ public class RacServicePool {
      */
     private static class PooledRacService {
         private final RacService racService;
-        private Instant lastAccess;
+        private volatile Instant lastAccess;
 
         PooledRacService(RacService racService, Instant createdAt) {
             this.racService = racService;
@@ -181,7 +211,10 @@ public class RacServicePool {
     /**
      * Обёртка над RacService, которая при close() не закрывает реальное соединение.
      */
-    private static class PooledRacServiceWrapper extends RacService {
+    // Важно: все методы RacService должны явно делегироваться delegate, включая init/close/shutdown,
+    // иначе унаследованная реализация может обратиться к null-полям super(null, null).
+    // Долгосрочно лучше выделить интерфейс для RacService или использовать proxy.
+    private static final class PooledRacServiceWrapper extends RacService {
 
         private final RacService delegate;
 
@@ -198,6 +231,11 @@ public class RacServicePool {
         @Override
         public void init() {
             // Не инициализируем - используем делегат
+        }
+
+        @Override
+        protected void shutdown() {
+            // Не вызываем shutdown базового класса, чтобы не обращаться к null-полям.
         }
 
         // Делегируем все методы к реальному RacService
